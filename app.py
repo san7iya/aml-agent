@@ -12,7 +12,8 @@ EXAMPLE_QUERIES = [
     ("Structuring", "Find structuring patterns in the last 30 days"),
     ("Customer risk", "Is customer ID C1231006815 suspicious?"),
     ("Transaction risk", "Show me high-risk transactions from the past week"),
-    ("General", "Give me a general overview of recent activity"),
+    ("EDA / Overview", "Profile this dataset"),
+    ("General", "What's going on lately?"),
 ]
 
 RISK_BAND_DISPLAY = {
@@ -101,3 +102,15 @@ if should_run:
             if matched_senders:
                 st.subheader(f"Matched Senders ({len(matched_senders)})")
                 st.dataframe(matched_senders, width="stretch")
+
+            type_breakdown = result.get("type_breakdown")
+            if type_breakdown:
+                st.subheader("Transaction Type Breakdown")
+                breakdown_cols = st.columns(len(type_breakdown))
+                for col, (label, count) in zip(breakdown_cols, type_breakdown.items()):
+                    col.metric(label, f"{count:,}")
+
+            signal_validation_summary = result.get("signal_validation_summary")
+            if signal_validation_summary:
+                st.subheader("Signal Validation Summary")
+                st.dataframe(signal_validation_summary, width="stretch")

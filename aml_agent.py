@@ -143,6 +143,9 @@ def build_plan(query: str) -> Dict[str, Any]:
     elif 'transaction' in text or 'high-risk' in text or 'flag' in text or 'suspicious' in text or 'risk' in text:
         intent = 'transaction_risk'
         tools = ['risk_scoring']
+    elif 'overview' in text or 'summary' in text or 'explore' in text or 'what does this data look like' in text or 'profile this dataset' in text:
+        intent = 'eda'
+        tools = ['dataset_profile', 'signal_validation_summary']
     else:
         intent = 'general'
         tools = ['risk_scoring']
@@ -195,6 +198,55 @@ def detect_structuring(df: pd.DataFrame) -> Dict[str, Any]:
         'risk_score': round(risk_score, 3),
         'risk_band': band,
         'reason': f'Detected {len(matched_senders)} sender(s) with repeated $9,000-$10,000 band activity, indicating possible structuring.',
+    }
+
+
+def run_eda(df: pd.DataFrame) -> Dict[str, Any]:
+    total_rows = len(df)
+    fraud_count = int(df['isFraud'].sum())
+    fraud_rate = round(fraud_count / total_rows, 6) if total_rows else 0.0
+
+    transfer_cashout_mask = df['type'].isin(['TRANSFER', 'CASH_OUT'])
+    transfer_cashout_count = int(transfer_cashout_mask.sum())
+    other_count = int(total_rows - transfer_cashout_count)
+
+    # Reuses SIGNAL_VALIDATION as-is rather than recomputing percentiles/precision/recall --
+    # those are already established by eval_signals.py against the full dataset.
+    signal_summary = [
+        {
+            'signal': name,
+            'validated_on_paysim': info['validation_status'] == 'validated_on_paysim',
+            'precision': info['precision'],
+            'recall': info['recall'],
+            'composite_weight': info['composite_weight'],
+        }
+        for name, info in SIGNAL_VALIDATION.items()
+    ]
+    validated_signals = [s['signal'] for s in signal_summary if s['validated_on_paysim']]
+    dataset_limited_signals = [s['signal'] for s in signal_summary if not s['validated_on_paysim']]
+
+    return {
+        'total_rows': total_rows,
+        'fraud_count': fraud_count,
+        'fraud_rate': fraud_rate,
+        'type_breakdown': {
+            'TRANSFER_CASH_OUT': transfer_cashout_count,
+            'other': other_count,
+        },
+        'signal_validation_summary': signal_summary,
+        'validated_signals': validated_signals,
+        'dataset_limited_signals': dataset_limited_signals,
+        'risk_score': 0.1,
+        'risk_band': 'low',
+        'reason': (
+            f'Dataset overview: {total_rows} row(s) analyzed, {fraud_count} labeled fraud '
+            f'({fraud_rate:.4%}), {transfer_cashout_count} TRANSFER/CASH_OUT vs {other_count} '
+            f'other-type transaction(s). Of the five scored heuristics, '
+            f'{", ".join(validated_signals) or "none"} '
+            f'{"is" if len(validated_signals) == 1 else "are"} validated as predictive on PaySim; '
+            f'{", ".join(dataset_limited_signals)} are implemented but dataset-limited '
+            f'(see Signal Validation in README).'
+        ),
     }
 
 
@@ -474,6 +526,8 @@ def analyze_query(query: str, data_path: Path | str | None = None) -> Dict[str, 
             result = detect_structuring(df)
         elif plan['intent'] == 'transaction_risk':
             result = detect_transaction_risk(df)
+        elif plan['intent'] == 'eda':
+            result = run_eda(df)
         else:
             result = {
                 'entity_id': None,

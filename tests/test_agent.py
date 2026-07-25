@@ -151,6 +151,28 @@ def test_transaction_risk_ignores_merchant_destination_mismatch(tmp_path):
     assert transaction_result['result']['flagged_transactions'] == []
 
 
+def test_eda_query_routes_to_eda_intent_and_returns_expected_structure(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = build_sample_dataset(tmp_path)
+
+    plan = agent.build_plan('Give me a summary of this dataset')
+    assert plan['intent'] == 'eda'
+
+    eda_result = agent.analyze_query('Profile this dataset', data_path)
+
+    assert eda_result['plan']['intent'] == 'eda'
+    result = eda_result['result']
+    assert result['total_rows'] == 5
+    assert result['fraud_count'] == 1
+    assert 'fraud_rate' in result
+    assert 'type_breakdown' in result
+    assert 'TRANSFER_CASH_OUT' in result['type_breakdown']
+    assert 'other' in result['type_breakdown']
+    assert 'signal_validation_summary' in result
+    assert 'large_amount' in result['validated_signals']
+    assert 'risk_band' in result
+
+
 def test_build_working_subset_accepts_custom_data_path(tmp_path):
     agent = load_module('aml_agent', 'aml_agent.py')
 
