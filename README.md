@@ -4,7 +4,7 @@ An AML (Anti-Money Laundering) suspicious activity detection agent for retail ba
 
 ## Problem Statement
 
-Financial institutions run rule-based AML compliance systems that generate excessive false positives, overwhelming compliance teams, while techniques like structuring and smurfing evade conventional detection. This project builds a query-driven agent that performs targeted analysis — not a fixed pipeline — parsing user intent to invoke only the tools relevant to that specific query (e.g. a structuring query triggers pattern detection; a single-customer query skips full EDA and does a direct lookup).
+Financial institutions run rule-based AML compliance systems that generate excessive false positives, overwhelming compliance teams, while techniques like structuring and smurfing evade conventional detection. This project builds a query-driven agent that performs targeted analysis — not a fixed pipeline — parsing user intent to invoke only the tools relevant to that specific query (e.g. a structuring query triggers pattern detection; a single-customer query does a direct lookup rather than broad dataset exploration).
 
 The current implementation keeps that routing explicit in code so each query only runs the analysis path it needs. That makes the behavior easier to test, easier to explain, and closer to how a real triage workflow should behave than a one-size-fits-all batch pipeline.
 
@@ -22,11 +22,12 @@ The repository does not include the Kaggle raw CSV in Git. If the file is missin
 
 ## Solution Approach
 
-1. **Intent parsing**: The query is normalized and classified into one of four intents: structuring, customer risk, transaction risk, or general.
-2. **Dynamic routing**: The agent chooses a different analysis path depending on that intent. Structuring queries run band-based pattern detection, customer queries run direct entity lookups, and transaction-risk queries focus on transfer/cash-out behavior.
-3. **Behavioral transaction scoring**: Transaction-risk scoring is driven by composite signals rather than a single raw-amount threshold. The current logic looks for sender velocity, rapid cash-out patterns, relative deviation from a sender’s typical amount, and structuring-band behavior.
-4. **Explanation**: Each result includes a short rule-based reason that names the signals that drove the score.
-5. **Escalation**: The final risk band maps to a simple action recommendation: monitor, review, or report.
+1. **Intent parsing**: The query is normalized and classified into one of five intents: structuring, customer risk, transaction risk, EDA/overview, or general.
+2. **Dynamic routing**: The agent chooses a different analysis path depending on that intent. Structuring queries run band-based pattern detection, customer queries (once a valid entity ID is resolved) run direct entity lookups, transaction-risk queries run feature engineering followed by composite behavioral scoring, and EDA/overview queries return a dataset-wide summary rather than a single-entity or single-signal result.
+3. **EDA / overview intent**: Triggered by phrases like "overview," "summary," "explore," or "profile this dataset." Returns total rows, fraud count and rate, a TRANSFER/CASH_OUT-vs-other transaction-type breakdown, and a condensed Signal Validation summary (which heuristics are validated vs. dataset-limited) — computed from the already-loaded working subset and the existing `SIGNAL_VALIDATION` constants, with no re-computation of percentile thresholds.
+4. **Behavioral transaction scoring**: Transaction-risk scoring is driven by composite signals rather than a single raw-amount threshold. A dedicated feature-engineering step (`engineer_transaction_features()`) computes sender velocity, rapid cash-out patterns, relative deviation from a sender's typical amount, and structuring-band behavior; `detect_transaction_risk()` then combines those with a large-amount check and weights each signal by its empirically validated predictive value (see Signal Validation).
+5. **Explanation**: Each result includes a short rule-based reason that names the signals that drove the score.
+6. **Escalation**: The final risk band maps to a simple action recommendation: monitor, review, or report.
 
 ## Signal Validation Summary
 
@@ -43,8 +44,18 @@ Every heuristic above is implemented; only `large_amount` demonstrated measurabl
 ## Architecture
 
 ```
-Query → Intent Parser → Router → [Structuring Detection | Customer Lookup | Transaction Risk Scoring] → Risk Classification → Explanation Text → Escalation Recommendation → Structured Output
+Query → Intent Parser → Router → [EDA Overview | Structuring Detection | Customer Lookup | Feature Engineering → Transaction Risk Scoring | General] → Risk Classification → Explanation Text → Escalation Recommendation → Structured Output
 ```
+
+### Mapping to the Hackathon Brief
+
+| Brief Component | Implementation |
+|---|---|
+| EDA Tool | `run_eda()` |
+| Feature Engineering Tool | `engineer_transaction_features()` |
+| Anomaly Detection Tool | `large_amount` threshold check + composite scoring in `detect_transaction_risk()` |
+| Risk Classification Tool | Per-intent `risk_band` mapping logic (low/medium/high thresholds) |
+| Explanation Component | Per-intent `reason` text generation (e.g. `detect_transaction_risk()`'s composite-signal explanation) |
 
 ## Tech Stack
 
@@ -80,13 +91,15 @@ If the dataset is not already present locally:
 streamlit run app.py
 ```
 
-Opens a single-page UI with example-query buttons for each intent (structuring, customer risk, transaction risk, general), an Agent Plan panel showing the detected intent/tools/entity, and a color-coded risk result.
+Opens a single-page UI with example-query buttons for each intent (structuring, customer risk, transaction risk, EDA/overview, general), an Agent Plan panel showing the detected intent/tools/entity, and a color-coded risk result.
 
 Alternatively, use the CLI directly:
 
 ```bash
 python aml_agent.py "Find structuring patterns in the last 30 days"
 python aml_agent.py "Is customer ID C1231006815 suspicious?"
+python aml_agent.py "Show me high-risk transactions from the past week"
+python aml_agent.py "Profile this dataset"
 pytest
 ```
 
@@ -142,4 +155,4 @@ Independent evaluation against the `isFraud` label (see Signal Validation below)
 
 ## What Makes This Solution Stand Out
 
-The code does not run a fixed pipeline for every prompt. It routes structuring, customer, and transaction questions through different logic paths, which keeps behavior tied to the query intent. The project is also easy to validate because the tests cover routing, dispatch, and subset building against a small sample dataset.
+The code does not run a fixed pipeline for every prompt. It routes structuring, customer, transaction, EDA/overview, and general questions through different logic paths, which keeps behavior tied to the query intent. The project is also easy to validate because the tests cover routing, dispatch, and subset building against a small sample dataset.
