@@ -77,17 +77,24 @@ If the dataset is not already present locally:
 ## Usage
 
 ```bash
+streamlit run app.py
+```
+
+Opens a single-page UI with example-query buttons for each intent (structuring, customer risk, transaction risk, general), an Agent Plan panel showing the detected intent/tools/entity, and a color-coded risk result.
+
+Alternatively, use the CLI directly:
+
+```bash
 python aml_agent.py "Find structuring patterns in the last 30 days"
 python aml_agent.py "Is customer ID C1231006815 suspicious?"
 pytest
 ```
 
-The CLI entry point is available in `aml_agent.py`. When the Streamlit UI is present in the workspace, launch it with `streamlit run app.py`.
-
 ## Project Structure
 
 ```
 ├── aml_agent.py
+├── app.py
 ├── Dataset/
 │   └── paysim dataset.csv  # raw PaySim CSV, kept out of Git
 ├── tests/

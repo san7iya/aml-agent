@@ -49,7 +49,7 @@ st.caption(
 st.write("Try an example query:")
 example_cols = st.columns(len(EXAMPLE_QUERIES))
 for col, (label, text) in zip(example_cols, EXAMPLE_QUERIES):
-    col.button(label, on_click=use_example, args=(text,), use_container_width=True)
+    col.button(label, on_click=use_example, args=(text,), width="stretch")
 
 with st.form("query_form"):
     query = st.text_input("Query", key="query")
@@ -95,9 +95,9 @@ if should_run:
             flagged_transactions = result.get("flagged_transactions")
             if flagged_transactions:
                 st.subheader(f'Flagged Transactions ({result.get("flagged_count", len(flagged_transactions))})')
-                st.dataframe(flagged_transactions, use_container_width=True)
+                st.dataframe(flagged_transactions, width="stretch")
 
             matched_senders = result.get("matched_senders")
             if matched_senders:
                 st.subheader(f"Matched Senders ({len(matched_senders)})")
-                st.dataframe(matched_senders, use_container_width=True)
+                st.dataframe(matched_senders, width="stretch")
