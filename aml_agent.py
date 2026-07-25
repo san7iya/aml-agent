@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
@@ -220,55 +221,76 @@ def detect_transaction_risk(df: pd.DataFrame, window_steps: int = 24) -> Dict[st
     structuring_senders = {item['sender'] for item in structuring_result.get('matched_senders', [])}
     large_amount_threshold = SIGNAL_VALIDATION['large_amount']['threshold']
 
-    sender_rows_map: Dict[str, pd.DataFrame] = {}
-    for sender in relevant['nameOrig'].astype(str).unique():
-        sender_rows_map[sender] = relevant[relevant['nameOrig'].astype(str) == sender].copy()
+    # Vectorized equivalent of the old per-sender iterrows() loop (profiled bottleneck: repeated
+    # full-column boolean masking to build sender_rows_map, then per-tiny-group pandas __setitem__
+    # calls). No detection logic, threshold, or weight changed; only how it's computed.
+    sender_key = relevant['nameOrig'].astype(str)
+    amount = relevant['amount'].to_numpy()
 
-    scored_rows: list[pd.DataFrame] = []
-    for sender, sender_rows in sender_rows_map.items():
-        sender_rows = sender_rows.sort_values('step').copy()
-        # large_amount needs no transaction history (validated: it fires on single one-off
-        # transfers, which is how most PaySim fraud senders behave), so it is evaluated for
-        # every sender. The four behavioral signals below still require >=3 transactions to be
-        # meaningful (validated: they only ever fire for repeat senders).
-        sender_rows['large_amount_signal'] = sender_rows['amount'] >= large_amount_threshold
-        sender_rows['velocity_signal'] = False
-        sender_rows['cashout_signal'] = False
-        sender_rows['deviation_signal'] = False
-        sender_rows['structuring_signal'] = False
+    # large_amount needs no transaction history (validated: it fires on single one-off
+    # transfers, which is how most PaySim fraud senders behave), so it is evaluated for every
+    # row directly. structuring_senders already implies >=3 total rows for every member (a
+    # band_count >= 3 requires total_transactions >= 3), so it needs no separate history gate
+    # either. The other three behavioral signals still require >=3 transactions to be
+    # meaningful (validated: they only ever fire for repeat senders).
+    large_amount_signal = amount >= large_amount_threshold
+    band_mask = (amount >= 9000) & (amount <= 10000)
+    structuring_signal = sender_key.isin(structuring_senders).to_numpy() & band_mask
 
-        if len(sender_rows) >= 3:
-            median_amount = sender_rows['amount'].median()
+    velocity_signal = np.zeros(len(relevant), dtype=bool)
+    cashout_signal = np.zeros(len(relevant), dtype=bool)
+    deviation_signal = np.zeros(len(relevant), dtype=bool)
 
-            for index, row in sender_rows.iterrows():
-                window_rows = sender_rows[(sender_rows['step'] >= row['step'] - window_steps) & (sender_rows['step'] <= row['step'])]
-                velocity_count = int(len(window_rows))
-                sender_rows.loc[index, 'velocity_signal'] = velocity_count >= 2
+    group_sizes = sender_key.groupby(sender_key).transform('size').to_numpy()
+    eligible_mask = group_sizes >= 3
 
-                recent_rows = sender_rows[sender_rows['step'] < row['step']]
-                if not recent_rows.empty:
-                    recent_rows = recent_rows[(recent_rows['step'] >= row['step'] - window_steps)]
-                    if not recent_rows.empty and row['nameDest'] not in {None, ''}:
-                        received_recently = recent_rows[recent_rows['nameDest'] == row['nameOrig']]
-                        sender_rows.loc[index, 'cashout_signal'] = not received_recently.empty
+    if eligible_mask.any():
+        eligible_positions = np.flatnonzero(eligible_mask)
+        eligible_df = relevant.iloc[eligible_positions]
+        eligible_keys = sender_key.iloc[eligible_positions]
 
-                if median_amount:
-                    deviation_ratio = row['amount'] / median_amount
-                    sender_rows.loc[index, 'deviation_signal'] = deviation_ratio >= 1.5 or deviation_ratio <= 0.67
+        for _, group_positions in eligible_df.groupby(eligible_keys, sort=False).groups.items():
+            group = relevant.loc[group_positions].sort_values('step')
+            local_pos = relevant.index.get_indexer(group.index)
 
-                sender_rows.loc[index, 'structuring_signal'] = sender in structuring_senders and row['amount'] >= 9000 and row['amount'] <= 10000
+            steps = group['step'].to_numpy()
+            amounts = group['amount'].to_numpy()
+            dest = group['nameDest'].to_numpy()
+            orig = group['nameOrig'].to_numpy()
 
-        sender_rows['composite_score'] = (
-            SIGNAL_VALIDATION['large_amount']['composite_weight'] * sender_rows['large_amount_signal'].astype(float)
-            + SIGNAL_VALIDATION['velocity']['composite_weight'] * sender_rows['velocity_signal'].astype(float)
-            + SIGNAL_VALIDATION['rapid_cash_out']['composite_weight'] * sender_rows['cashout_signal'].astype(float)
-            + SIGNAL_VALIDATION['relative_deviation']['composite_weight'] * sender_rows['deviation_signal'].astype(float)
-            + SIGNAL_VALIDATION['structuring']['composite_weight'] * sender_rows['structuring_signal'].astype(float)
-        )
+            lo_v = np.searchsorted(steps, steps - window_steps, side='left')
+            hi_v = np.searchsorted(steps, steps, side='right')
+            velocity_signal[local_pos] = (hi_v - lo_v) >= 2
 
-        scored_rows.append(sender_rows)
+            dest_is_self = (dest == orig[0]).astype(np.int64)
+            prefix = np.concatenate(([0], np.cumsum(dest_is_self)))
+            lo_c = np.searchsorted(steps, steps - window_steps, side='left')
+            hi_c = np.searchsorted(steps, steps, side='left')
+            has_recent_self_dest = (prefix[hi_c] - prefix[lo_c]) > 0
+            current_dest_notna = np.array([d not in (None, '') for d in dest])
+            cashout_signal[local_pos] = has_recent_self_dest & current_dest_notna
 
-    if not scored_rows:
+            median_amount = np.median(amounts)
+            if median_amount:
+                ratio = amounts / median_amount
+                deviation_signal[local_pos] = (ratio >= 1.5) | (ratio <= 0.67)
+
+    relevant['large_amount_signal'] = large_amount_signal
+    relevant['velocity_signal'] = velocity_signal
+    relevant['cashout_signal'] = cashout_signal
+    relevant['deviation_signal'] = deviation_signal
+    relevant['structuring_signal'] = structuring_signal
+    relevant['composite_score'] = (
+        SIGNAL_VALIDATION['large_amount']['composite_weight'] * relevant['large_amount_signal'].astype(float)
+        + SIGNAL_VALIDATION['velocity']['composite_weight'] * relevant['velocity_signal'].astype(float)
+        + SIGNAL_VALIDATION['rapid_cash_out']['composite_weight'] * relevant['cashout_signal'].astype(float)
+        + SIGNAL_VALIDATION['relative_deviation']['composite_weight'] * relevant['deviation_signal'].astype(float)
+        + SIGNAL_VALIDATION['structuring']['composite_weight'] * relevant['structuring_signal'].astype(float)
+    )
+
+    scored_rows_df = relevant
+
+    if scored_rows_df.empty:
         return {
             'flagged_transactions': [],
             'flagged_count': 0,
@@ -278,7 +300,6 @@ def detect_transaction_risk(df: pd.DataFrame, window_steps: int = 24) -> Dict[st
             'reason': 'No composite behavioral signals were detected for transaction risk.',
         }
 
-    scored_rows_df = pd.concat(scored_rows, ignore_index=True)
     flagged_rows = scored_rows_df[
         scored_rows_df['large_amount_signal'] |
         scored_rows_df['velocity_signal'] |
