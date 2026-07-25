@@ -88,7 +88,7 @@ The CLI entry point is available in `aml_agent.py`. When the Streamlit UI is pre
 
 ## Known Limitations
 
-The scoring logic is heuristic and tuned for the PaySim schema rather than a production AML program. The dataset is synthetic, so it is useful for demonstration and testing but cannot prove real-world laundering behavior. The Streamlit UI is intended for interactive review, while the CLI remains the simplest way to exercise the agent directly from the terminal.
+The scoring logic is heuristic and tuned for the PaySim schema rather than a production AML program. The dataset is synthetic, so it is useful for demonstration and testing but cannot prove real-world laundering behavior. A large share of labeled fraud in this dataset occurs at a small number of fixed high-value amounts, which is a property of the synthetic data generation rather than a pattern independently discovered by the detection logic. In particular, PaySim commonly injects fraud labels around a small set of round amounts (for example, $10,000,000 appears repeatedly in the dataset), so unusually large round-number transactions should be treated as a synthetic artifact of the generator rather than as a naturally discovered AML pattern. The Streamlit UI is intended for interactive review, while the CLI remains the simplest way to exercise the agent directly from the terminal.
 
 ## What Makes This Solution Stand Out
 

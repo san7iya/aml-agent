@@ -3,6 +3,9 @@ Dataset/
 paysim_working_subset.csv
 *.csv
 
+#artifact
+customer_index.sqlite3
+
 # python
 __pycache__/
 *.pyc
@@ -16,3 +19,4 @@ env/
 
 # internal planning doc
 HANDOFF.md
+

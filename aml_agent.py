@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict
 
@@ -9,6 +11,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 DATASET_PATH = ROOT / 'Dataset' / 'paysim dataset.csv'
 WORKING_SUBSET_PATH = ROOT / 'paysim_working_subset.csv'
+CUSTOMER_INDEX_PATH = ROOT / 'customer_index.sqlite3'
 
 
 def build_working_subset(output_path: Path | str | None = None, sample_size: int = 50000, data_path: Path | str | None = None) -> Path:
@@ -73,7 +76,7 @@ def build_plan(query: str) -> Dict[str, Any]:
         intent = 'general'
         tools = ['risk_scoring']
 
-    entity_match = re.search(r'\b(?:customer|account|sender|id)\s*(?:id\s*)?([A-Za-z]?\d+)\b', query, re.I)
+    entity_match = re.search(r'\b(?:customer|account|sender|id)\s*(?:id\s*)?([A-Za-z]\d+|\d+)\b', query, re.I)
     entity_id = entity_match.group(1) if entity_match else None
 
     return {
@@ -125,28 +128,40 @@ def detect_structuring(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def detect_transaction_risk(df: pd.DataFrame) -> Dict[str, Any]:
-    high_value_mask = (df['type'].isin(['TRANSFER', 'CASH_OUT'])) & (df['amount'] >= 50000)
-    mismatch_mask = (
-        (df['oldbalanceOrg'] - df['newbalanceOrig']).abs() > 1
-    ) | (
-        (df['oldbalanceDest'] - df['newbalanceDest']).abs() > 1
-    )
+    relevant = df[df['type'].isin(['TRANSFER', 'CASH_OUT'])].copy()
+    if relevant.empty:
+        return {
+            'flagged_transactions': [],
+            'risk_score': 0.2,
+            'risk_band': 'low',
+            'reason': 'No transfer or cash-out transactions were available for review.',
+        }
 
-    flagged_rows = df[high_value_mask | mismatch_mask].copy()
+    high_value_threshold = float(relevant['amount'].quantile(0.99))
+    source_balance_delta = (relevant['oldbalanceOrg'] - relevant['amount']) - relevant['newbalanceOrig']
+    source_mismatch_mask = source_balance_delta.abs() > 1000
+    mismatch_mask = source_mismatch_mask
+    high_value_mask = relevant['amount'] >= high_value_threshold
+
+    flagged_rows = relevant[high_value_mask].copy()
     flagged_rows = flagged_rows.sort_values('amount', ascending=False)
 
     if flagged_rows.empty:
         return {
             'flagged_transactions': [],
+            'flagged_count': 0,
+            'flagged_rate': 0.0,
             'risk_score': 0.2,
             'risk_band': 'low',
             'reason': 'No high-value transfer or balance-mismatch transactions were detected.',
         }
 
     fraud_count = int(flagged_rows['isFraud'].sum())
-    big_txn_count = int((flagged_rows['amount'] >= 50000).sum())
-    mismatch_count = int(mismatch_mask.sum())
-    risk_score = min(1.0, 0.2 + 0.15 * big_txn_count + 0.2 * mismatch_count + 0.1 * fraud_count)
+    big_txn_count = int((flagged_rows['amount'] >= high_value_threshold).sum())
+    mismatch_count = int(mismatch_mask[high_value_mask].sum())
+    flagged_count = int(len(flagged_rows))
+    flagged_rate = round(flagged_count / len(relevant), 4) if len(relevant) else 0.0
+    risk_score = min(1.0, 0.2 + 0.25 * big_txn_count + 0.2 * mismatch_count + 0.15 * fraud_count)
     if risk_score >= 0.8:
         band = 'high'
     elif risk_score >= 0.55:
@@ -156,10 +171,60 @@ def detect_transaction_risk(df: pd.DataFrame) -> Dict[str, Any]:
 
     return {
         'flagged_transactions': flagged_rows[['step', 'type', 'amount', 'nameOrig', 'nameDest', 'isFraud']].head(5).to_dict(orient='records'),
+        'flagged_count': flagged_count,
+        'flagged_rate': flagged_rate,
         'risk_score': round(risk_score, 3),
         'risk_band': band,
-        'reason': f'Detected {big_txn_count} high-value transaction(s) and {mismatch_count} balance-mismatch signal(s).',
+        'reason': f'Filtering is driven by the high-value threshold ({high_value_threshold:.2f}); {mismatch_count} transactions in that high-value set also showed an origin-side balance mismatch, which is included as contextual evidence rather than a separate filter.',
     }
+
+
+def _build_customer_index(data_path: Path | str, index_path: Path | str = CUSTOMER_INDEX_PATH, chunksize: int = 250000) -> sqlite3.Connection:
+    data_path = Path(data_path)
+    index_path = Path(index_path)
+    required_columns = [
+        'step', 'type', 'amount', 'nameOrig', 'oldbalanceOrg', 'newbalanceOrig',
+        'nameDest', 'oldbalanceDest', 'newbalanceDest', 'isFraud', 'isFlaggedFraud',
+    ]
+
+    conn = sqlite3.connect(index_path)
+    conn.execute('DROP TABLE IF EXISTS account_activity')
+    conn.execute('CREATE TABLE account_activity (account_id TEXT PRIMARY KEY, rows_json TEXT)')
+
+    account_rows: Dict[str, list[Dict[str, Any]]] = {}
+    for chunk in pd.read_csv(data_path, chunksize=chunksize, usecols=required_columns):
+        for account_id in chunk['nameOrig'].astype(str).unique():
+            account_rows.setdefault(account_id, []).extend(chunk.loc[chunk['nameOrig'].astype(str) == account_id].to_dict(orient='records'))
+
+    for account_id, rows in account_rows.items():
+        conn.execute('INSERT INTO account_activity (account_id, rows_json) VALUES (?, ?)', (account_id, json.dumps(rows)))
+
+    conn.commit()
+    conn.close()
+    return sqlite3.connect(index_path)
+
+
+def load_customer_activity(data_path: Path | str, entity_id: str, chunksize: int = 250000) -> pd.DataFrame:
+    data_path = Path(data_path)
+    entity_id = str(entity_id)
+    required_columns = [
+        'step', 'type', 'amount', 'nameOrig', 'oldbalanceOrg', 'newbalanceOrig',
+        'nameDest', 'oldbalanceDest', 'newbalanceDest', 'isFraud', 'isFlaggedFraud',
+    ]
+
+    index_path = ROOT / 'customer_index.sqlite3'
+    if not index_path.exists():
+        _build_customer_index(data_path, index_path, chunksize=chunksize)
+
+    conn = sqlite3.connect(index_path)
+    cursor = conn.execute('SELECT rows_json FROM account_activity WHERE account_id = ?', (entity_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return pd.DataFrame(columns=required_columns)
+    rows = json.loads(row[0])
+    return pd.DataFrame(rows)
 
 
 def score_customer(df: pd.DataFrame, entity_id: str) -> Dict[str, Any]:
@@ -195,21 +260,24 @@ def score_customer(df: pd.DataFrame, entity_id: str) -> Dict[str, Any]:
 
 def analyze_query(query: str, data_path: Path | str | None = None) -> Dict[str, Any]:
     plan = build_plan(query)
-    df = load_working_subset(data_path)
 
-    if plan['intent'] == 'structuring':
-        result = detect_structuring(df)
-    elif plan['intent'] == 'transaction_risk':
-        result = detect_transaction_risk(df)
-    elif plan['intent'] == 'customer_risk' and plan['entity_id'] is not None:
+    if plan['intent'] == 'customer_risk' and plan['entity_id'] is not None:
+        dataset_path = Path(data_path or DATASET_PATH)
+        df = load_customer_activity(dataset_path, plan['entity_id'])
         result = score_customer(df, plan['entity_id'])
     else:
-        result = {
-            'entity_id': None,
-            'risk_score': 0.25,
-            'risk_band': 'low',
-            'reason': 'No specific pattern was detected from the query terms.',
-        }
+        df = load_working_subset(data_path)
+        if plan['intent'] == 'structuring':
+            result = detect_structuring(df)
+        elif plan['intent'] == 'transaction_risk':
+            result = detect_transaction_risk(df)
+        else:
+            result = {
+                'entity_id': None,
+                'risk_score': 0.25,
+                'risk_band': 'low',
+                'reason': 'No specific pattern was detected from the query terms.',
+            }
 
     return {
         'plan': plan,

@@ -77,6 +77,53 @@ def test_analyze_query_dispatches_real_intent_logic(tmp_path):
     assert structuring_result['result']['reason'] != customer_result['result']['reason']
 
 
+def test_transaction_risk_exposes_flagged_count_metadata(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = build_sample_dataset(tmp_path)
+
+    transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
+
+    assert 'flagged_count' in transaction_result['result']
+    assert 'flagged_rate' in transaction_result['result']
+    assert transaction_result['result']['flagged_count'] >= len(transaction_result['result']['flagged_transactions'])
+
+
+def test_transaction_risk_reason_describes_threshold_as_filter(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = build_sample_dataset(tmp_path)
+
+    transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
+
+    assert 'high-value threshold' in transaction_result['result']['reason'].lower()
+    assert 'context' in transaction_result['result']['reason'].lower() or 'broader' in transaction_result['result']['reason'].lower()
+
+
+def test_transaction_risk_ignores_merchant_destination_mismatch(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = tmp_path / 'merchant_mismatch.csv'
+    pd.DataFrame(
+        {
+            'step': [1, 2],
+            'type': ['TRANSFER', 'TRANSFER'],
+            'amount': [10.0, 1000.0],
+            'nameOrig': ['C1231006815', 'C1231006815'],
+            'oldbalanceOrg': [100.0, 2000.0],
+            'newbalanceOrig': [90.0, 1000.0],
+            'nameDest': ['M1', 'C2'],
+            'oldbalanceDest': [999.0, 0.0],
+            'newbalanceDest': [1000.0, 0.0],
+            'isFraud': [0, 0],
+            'isFlaggedFraud': [0, 0],
+        }
+    ).to_csv(data_path, index=False)
+
+    transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
+
+    assert transaction_result['result']['flagged_count'] == 1
+    assert transaction_result['result']['flagged_rate'] == 0.5
+    assert not any(item['step'] == 1 for item in transaction_result['result']['flagged_transactions'])
+
+
 def test_build_working_subset_accepts_custom_data_path(tmp_path):
     agent = load_module('aml_agent', 'aml_agent.py')
 
