@@ -28,6 +28,18 @@ The repository does not include the Kaggle raw CSV in Git. If the file is missin
 4. **Explanation**: Each result includes a short rule-based reason that names the signals that drove the score.
 5. **Escalation**: The final risk band maps to a simple action recommendation: monitor, review, or report.
 
+## Signal Validation Summary
+
+| Heuristic | Implemented | Validated on PaySim |
+|-----------|-------------|---------------------|
+| Large Amount | Yes | Yes |
+| Velocity | Yes | Dataset limitation |
+| Rapid Cash-out | Yes | Dataset limitation |
+| Relative Deviation | Yes | Dataset limitation |
+| Structuring | Yes | Dataset limitation |
+
+Every heuristic above is implemented; only `large_amount` demonstrated measurable predictive value on PaySim. The other four correspond to legitimate AML behaviors that this synthetic dataset does not represent, not heuristics that fail to work in general. See "Signal Validation" below for the full evaluation methodology, figures, and per-heuristic reasoning.
+
 ## Architecture
 
 ```
@@ -88,7 +100,9 @@ The CLI entry point is available in `aml_agent.py`. When the Streamlit UI is pre
 
 ## Known Limitations
 
-The scoring logic is heuristic and tuned for the PaySim schema rather than a production AML program. The dataset is synthetic, so it is useful for demonstration and testing but cannot prove real-world laundering behavior. A large share of labeled fraud in this dataset occurs at a small number of fixed high-value amounts, which is a property of the synthetic data generation rather than a pattern independently discovered by the detection logic. In particular, PaySim commonly injects fraud labels around a small set of round amounts (for example, $10,000,000 appears repeatedly in the dataset), so unusually large round-number transactions should be treated as a synthetic artifact of the generator rather than as a naturally discovered AML pattern. The current transaction-risk path still needs further calibration on the real dataset, because the full-data distributions show that the present heuristics do not yet surface defensible flagged cases from the raw PaySim file. The Streamlit UI is intended for interactive review, while the CLI remains the simplest way to exercise the agent directly from the terminal.
+The scoring logic is heuristic and tuned for the PaySim schema rather than a production AML program. The dataset is synthetic, so it is useful for demonstration and testing but cannot prove real-world laundering behavior. A large share of labeled fraud in this dataset occurs at a small number of fixed high-value amounts, which is a property of the synthetic data generation rather than a pattern independently discovered by the detection logic. In particular, PaySim commonly injects fraud labels around a small set of round amounts (for example, $10,000,000 appears repeatedly in the dataset), so unusually large round-number transactions should be treated as a synthetic artifact of the generator rather than as a naturally discovered AML pattern.
+
+Independent evaluation against the `isFraud` label (see Signal Validation below) shows this is not simply a matter of further threshold tuning: `large_amount` demonstrated measurable predictive value on PaySim (16.04% recall, 4.75% precision), while `velocity`, `rapid_cash_out`, `relative_deviation`, and `structuring` are correctly implemented but unsupported by this synthetic dataset's characteristics — PaySim does not simulate repeat-sender activity, receive-then-relay mule chains, or structuring/smurfing behavior at all, so no amount of threshold adjustment on this dataset will make those heuristics detect patterns that were never generated in the first place. This is a limitation of the dataset, not evidence that those heuristics are ineffective for real-world AML monitoring. The Streamlit UI is intended for interactive review, while the CLI remains the simplest way to exercise the agent directly from the terminal.
 
 ## Signal Validation
 
@@ -113,7 +127,7 @@ The scoring logic is heuristic and tuned for the PaySim schema rather than a pro
 | `relative_deviation` | Yes | No | Requires ≥2 transactions per sender to establish a baseline; almost no senders qualify. |
 | `structuring` (strict & relaxed) | Yes | No | Zero matches dataset-wide — PaySim's fraud generator does not simulate structuring/smurfing behavior at all. |
 
-`large_amount` is now the dominant contributor to `transaction_risk`'s composite score (see `SIGNAL_VALIDATION` in `aml_agent.py`), with the other four heuristics kept in the pipeline at their original weight so they still contribute when triggered, without being able to outweigh a validated signal.
+`large_amount` is weighted as the dominant contributor to `transaction_risk`'s composite score specifically because it was the only heuristic that demonstrated measurable predictive value in this empirical evaluation (see `SIGNAL_VALIDATION` in `aml_agent.py`) — the weighting reflects evidence gathered from `eval_signals.py`, not an assumption that amount-based detection is inherently superior. The other four heuristics are kept in the pipeline at their original weight, not because they proved effective on PaySim, but to preserve a modular, extensible detection architecture: `velocity`, `rapid_cash_out`, `relative_deviation`, and `structuring` target real AML behaviors that this synthetic dataset doesn't represent, and would regain influence automatically — without any code changes beyond re-running `eval_signals.py` against the new data — on a dataset, or in production, where those patterns actually occur.
 
 **Scope note on raw counts**: the table above is computed by `eval_signals.py` directly against the full 6,362,620-row raw CSV (2,770,409 TRANSFER/CASH_OUT rows). The CLI's `transaction_risk` path instead runs against `paysim_working_subset.csv` — a much smaller, fraud-enriched sample (all labeled frauds plus a capped non-fraud sample; see `build_working_subset()`). Both use the identical `large_amount` threshold (`SIGNAL_VALIDATION['large_amount']['threshold']`), so a `flagged_count` you see from the CLI will legitimately differ from the 27,705 figure above — same signal, same threshold, different (and much smaller, much more fraud-dense) population — not an inconsistency in the logic.
 
