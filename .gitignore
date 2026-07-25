@@ -20,3 +20,6 @@ env/
 # internal planning doc
 HANDOFF.md
 
+# local agent tooling config
+.claude/
+

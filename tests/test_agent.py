@@ -88,14 +88,41 @@ def test_transaction_risk_exposes_flagged_count_metadata(tmp_path):
     assert transaction_result['result']['flagged_count'] >= len(transaction_result['result']['flagged_transactions'])
 
 
-def test_transaction_risk_reason_describes_threshold_as_filter(tmp_path):
+def test_transaction_risk_reason_describes_composite_signals(tmp_path):
     agent = load_module('aml_agent', 'aml_agent.py')
     data_path = build_sample_dataset(tmp_path)
 
     transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
 
-    assert 'high-value threshold' in transaction_result['result']['reason'].lower()
-    assert 'context' in transaction_result['result']['reason'].lower() or 'broader' in transaction_result['result']['reason'].lower()
+    assert 'composite' in transaction_result['result']['reason'].lower()
+    assert 'velocity' in transaction_result['result']['reason'].lower() or 'structuring' in transaction_result['result']['reason'].lower()
+
+
+def test_transaction_risk_flags_behavioral_signals_over_amount_artifact(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = tmp_path / 'behavioral.csv'
+    pd.DataFrame(
+        {
+            'step': [1, 2, 3, 10],
+            'type': ['TRANSFER', 'TRANSFER', 'TRANSFER', 'CASH_OUT'],
+            'amount': [9500.0, 9600.0, 9800.0, 5000.0],
+            'nameOrig': ['C1231006815', 'C1231006815', 'C1231006815', 'C1231006815'],
+            'oldbalanceOrg': [100000.0, 90000.0, 80400.0, 60000.0],
+            'newbalanceOrig': [90000.0, 80400.0, 70600.0, 55000.0],
+            'nameDest': ['C1', 'C2', 'C3', 'C4'],
+            'oldbalanceDest': [0.0, 0.0, 0.0, 0.0],
+            'newbalanceDest': [0.0, 0.0, 0.0, 0.0],
+            'isFraud': [0, 0, 0, 0],
+            'isFlaggedFraud': [0, 0, 0, 0],
+        }
+    ).to_csv(data_path, index=False)
+
+    transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
+
+    flagged_rows = transaction_result['result']['flagged_transactions']
+    assert flagged_rows
+    assert any(item['amount'] != 10000000.0 for item in flagged_rows)
+    assert any(item['signals']['structuring'] for item in flagged_rows)
 
 
 def test_transaction_risk_ignores_merchant_destination_mismatch(tmp_path):
@@ -119,9 +146,9 @@ def test_transaction_risk_ignores_merchant_destination_mismatch(tmp_path):
 
     transaction_result = agent.analyze_query('Show me high-risk transactions from the past week', data_path)
 
-    assert transaction_result['result']['flagged_count'] == 1
-    assert transaction_result['result']['flagged_rate'] == 0.5
-    assert not any(item['step'] == 1 for item in transaction_result['result']['flagged_transactions'])
+    assert transaction_result['result']['flagged_count'] == 0
+    assert transaction_result['result']['flagged_rate'] == 0.0
+    assert transaction_result['result']['flagged_transactions'] == []
 
 
 def test_build_working_subset_accepts_custom_data_path(tmp_path):
