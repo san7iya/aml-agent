@@ -134,13 +134,26 @@ def load_working_subset(path: Path | str | None = None) -> pd.DataFrame:
 def build_plan(query: str) -> Dict[str, Any]:
     text = query.lower()
 
+    entity_match = re.search(r'\b(?:customer|account|sender|id)\s*(?:id\s*)?([A-Za-z]\d+|\d+)\b', query, re.I)
+    entity_id = entity_match.group(1) if entity_match else None
+
+    # Aggregation/threshold language ("10+ transactions", "multiple", "under $10,000") describes
+    # the same multi-transaction behavior transaction_risk already scores (velocity, amount
+    # thresholds), so it's treated as an additional trigger for that intent rather than a new one.
+    has_aggregation_language = (
+        bool(re.search(r'\d+\+', text))
+        or 'multiple' in text
+        or bool(re.search(r'\bunder\s*\$?\d', text))
+        or bool(re.search(r'\b\d+\s*(?:or more\s+)?transactions?\b', text))
+    )
+
     if 'structur' in text or 'smurf' in text or 'pattern' in text:
         intent = 'structuring'
         tools = ['feature_engineering', 'anomaly_detection', 'risk_scoring']
-    elif 'customer' in text or 'customer id' in text or 'account' in text or 'sender' in text:
+    elif ('customer' in text or 'customer id' in text or 'account' in text or 'sender' in text) and entity_id is not None:
         intent = 'customer_risk'
         tools = ['customer_profile', 'risk_scoring']
-    elif 'transaction' in text or 'high-risk' in text or 'flag' in text or 'suspicious' in text or 'risk' in text:
+    elif 'transaction' in text or 'high-risk' in text or 'flag' in text or 'suspicious' in text or 'risk' in text or has_aggregation_language:
         intent = 'transaction_risk'
         tools = ['risk_scoring']
     elif 'overview' in text or 'summary' in text or 'explore' in text or 'what does this data look like' in text or 'profile this dataset' in text:
@@ -149,9 +162,6 @@ def build_plan(query: str) -> Dict[str, Any]:
     else:
         intent = 'general'
         tools = ['risk_scoring']
-
-    entity_match = re.search(r'\b(?:customer|account|sender|id)\s*(?:id\s*)?([A-Za-z]\d+|\d+)\b', query, re.I)
-    entity_id = entity_match.group(1) if entity_match else None
 
     return {
         'intent': intent,
@@ -258,52 +268,47 @@ def _looks_like_customer_account(value: Any) -> bool:
     return False
 
 
-def detect_transaction_risk(df: pd.DataFrame, window_steps: int = 24) -> Dict[str, Any]:
-    relevant = df[df['type'].isin(['TRANSFER', 'CASH_OUT'])].copy()
-    if relevant.empty:
-        return {
-            'flagged_transactions': [],
-            'risk_score': 0.2,
-            'risk_band': 'low',
-            'reason': 'No transfer or cash-out transactions were available for review.',
-        }
+def engineer_transaction_features(df: pd.DataFrame, window_steps: int = 24) -> pd.DataFrame:
+    """Feature Engineering Tool: computes the four raw behavioral signals per transaction --
+    velocity, rapid_cash_out, relative_deviation, and structuring-band membership -- with no
+    scoring, weighting, or thresholding. detect_transaction_risk applies those on top of this
+    output. `df` is expected to already be filtered to TRANSFER/CASH_OUT and sorted by
+    ['nameOrig', 'step', 'amount'], matching what detect_transaction_risk passes in.
 
-    relevant = relevant.sort_values(['nameOrig', 'step', 'amount']).reset_index(drop=True)
-    structuring_result = detect_structuring(relevant)
+    Vectorized (profiled bottleneck in the old per-sender iterrows() implementation: repeated
+    full-column boolean masking to build a sender map, then per-tiny-group pandas __setitem__
+    calls). No detection logic, threshold, or weight changed from that implementation; only how
+    it's computed.
+    """
+    features = df.copy()
+
+    structuring_result = detect_structuring(features)
     structuring_senders = {item['sender'] for item in structuring_result.get('matched_senders', [])}
-    large_amount_threshold = SIGNAL_VALIDATION['large_amount']['threshold']
 
-    # Vectorized equivalent of the old per-sender iterrows() loop (profiled bottleneck: repeated
-    # full-column boolean masking to build sender_rows_map, then per-tiny-group pandas __setitem__
-    # calls). No detection logic, threshold, or weight changed; only how it's computed.
-    sender_key = relevant['nameOrig'].astype(str)
-    amount = relevant['amount'].to_numpy()
+    sender_key = features['nameOrig'].astype(str)
+    amount = features['amount'].to_numpy()
 
-    # large_amount needs no transaction history (validated: it fires on single one-off
-    # transfers, which is how most PaySim fraud senders behave), so it is evaluated for every
-    # row directly. structuring_senders already implies >=3 total rows for every member (a
-    # band_count >= 3 requires total_transactions >= 3), so it needs no separate history gate
-    # either. The other three behavioral signals still require >=3 transactions to be
-    # meaningful (validated: they only ever fire for repeat senders).
-    large_amount_signal = amount >= large_amount_threshold
     band_mask = (amount >= 9000) & (amount <= 10000)
     structuring_signal = sender_key.isin(structuring_senders).to_numpy() & band_mask
 
-    velocity_signal = np.zeros(len(relevant), dtype=bool)
-    cashout_signal = np.zeros(len(relevant), dtype=bool)
-    deviation_signal = np.zeros(len(relevant), dtype=bool)
+    velocity_signal = np.zeros(len(features), dtype=bool)
+    cashout_signal = np.zeros(len(features), dtype=bool)
+    deviation_signal = np.zeros(len(features), dtype=bool)
 
+    # velocity/rapid_cash_out/relative_deviation all require transaction history to be
+    # meaningful (validated: they only ever fire for repeat senders), so only senders with
+    # >=3 total transactions are evaluated; the rest keep the False default above.
     group_sizes = sender_key.groupby(sender_key).transform('size').to_numpy()
     eligible_mask = group_sizes >= 3
 
     if eligible_mask.any():
         eligible_positions = np.flatnonzero(eligible_mask)
-        eligible_df = relevant.iloc[eligible_positions]
+        eligible_df = features.iloc[eligible_positions]
         eligible_keys = sender_key.iloc[eligible_positions]
 
         for _, group_positions in eligible_df.groupby(eligible_keys, sort=False).groups.items():
-            group = relevant.loc[group_positions].sort_values('step')
-            local_pos = relevant.index.get_indexer(group.index)
+            group = features.loc[group_positions].sort_values('step')
+            local_pos = features.index.get_indexer(group.index)
 
             steps = group['step'].to_numpy()
             amounts = group['amount'].to_numpy()
@@ -327,20 +332,39 @@ def detect_transaction_risk(df: pd.DataFrame, window_steps: int = 24) -> Dict[st
                 ratio = amounts / median_amount
                 deviation_signal[local_pos] = (ratio >= 1.5) | (ratio <= 0.67)
 
-    relevant['large_amount_signal'] = large_amount_signal
-    relevant['velocity_signal'] = velocity_signal
-    relevant['cashout_signal'] = cashout_signal
-    relevant['deviation_signal'] = deviation_signal
-    relevant['structuring_signal'] = structuring_signal
-    relevant['composite_score'] = (
-        SIGNAL_VALIDATION['large_amount']['composite_weight'] * relevant['large_amount_signal'].astype(float)
-        + SIGNAL_VALIDATION['velocity']['composite_weight'] * relevant['velocity_signal'].astype(float)
-        + SIGNAL_VALIDATION['rapid_cash_out']['composite_weight'] * relevant['cashout_signal'].astype(float)
-        + SIGNAL_VALIDATION['relative_deviation']['composite_weight'] * relevant['deviation_signal'].astype(float)
-        + SIGNAL_VALIDATION['structuring']['composite_weight'] * relevant['structuring_signal'].astype(float)
-    )
+    features['velocity_signal'] = velocity_signal
+    features['cashout_signal'] = cashout_signal
+    features['deviation_signal'] = deviation_signal
+    features['structuring_signal'] = structuring_signal
+    return features
 
-    scored_rows_df = relevant
+
+def detect_transaction_risk(df: pd.DataFrame, window_steps: int = 24) -> Dict[str, Any]:
+    relevant = df[df['type'].isin(['TRANSFER', 'CASH_OUT'])].copy()
+    if relevant.empty:
+        return {
+            'flagged_transactions': [],
+            'risk_score': 0.2,
+            'risk_band': 'low',
+            'reason': 'No transfer or cash-out transactions were available for review.',
+        }
+
+    relevant = relevant.sort_values(['nameOrig', 'step', 'amount']).reset_index(drop=True)
+    large_amount_threshold = SIGNAL_VALIDATION['large_amount']['threshold']
+
+    # large_amount needs no transaction history (validated: it fires on single one-off
+    # transfers, which is how most PaySim fraud senders behave), so it's scored directly here
+    # rather than in engineer_transaction_features, which only covers the four signals that do
+    # need per-sender history/context.
+    scored_rows_df = engineer_transaction_features(relevant, window_steps=window_steps)
+    scored_rows_df['large_amount_signal'] = scored_rows_df['amount'].to_numpy() >= large_amount_threshold
+    scored_rows_df['composite_score'] = (
+        SIGNAL_VALIDATION['large_amount']['composite_weight'] * scored_rows_df['large_amount_signal'].astype(float)
+        + SIGNAL_VALIDATION['velocity']['composite_weight'] * scored_rows_df['velocity_signal'].astype(float)
+        + SIGNAL_VALIDATION['rapid_cash_out']['composite_weight'] * scored_rows_df['cashout_signal'].astype(float)
+        + SIGNAL_VALIDATION['relative_deviation']['composite_weight'] * scored_rows_df['deviation_signal'].astype(float)
+        + SIGNAL_VALIDATION['structuring']['composite_weight'] * scored_rows_df['structuring_signal'].astype(float)
+    )
 
     if scored_rows_df.empty:
         return {

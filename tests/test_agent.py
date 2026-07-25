@@ -53,6 +53,22 @@ def test_intent_parsing_and_routing():
     assert 'risk_scoring' in plan['tools']
 
 
+def test_aggregation_phrasing_without_entity_id_routes_to_transaction_risk(tmp_path):
+    agent = load_module('aml_agent', 'aml_agent.py')
+    data_path = build_sample_dataset(tmp_path)
+
+    query = 'which customers made 10+ transactions under $10,000'
+    plan = agent.build_plan(query)
+    assert plan['intent'] == 'transaction_risk'
+    assert plan['entity_id'] is None
+
+    result = agent.analyze_query(query, data_path)
+    assert result['plan']['intent'] == 'transaction_risk'
+    assert 'flagged_transactions' in result['result']
+    assert result['result']['flagged_transactions']
+    assert result['result']['reason'] != 'No specific pattern was detected from the query terms.'
+
+
 def test_analyze_query_dispatches_real_intent_logic(tmp_path):
     agent = load_module('aml_agent', 'aml_agent.py')
     data_path = build_sample_dataset(tmp_path)
