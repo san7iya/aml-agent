@@ -1,0 +1,18 @@
+# dataset - too large, users download per README instructions
+Dataset/
+paysim_working_subset.csv
+*.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# misc
+.pytest_cache/
+.env
+
+# internal planning doc
+HANDOFF.md
